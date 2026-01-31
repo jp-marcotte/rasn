@@ -21,6 +21,7 @@ pub enum CodecEncodeError {
     Coer(CoerEncodeErrorKind),
     Xer(XerEncodeErrorKind),
     Gser(GserEncodeErrorKind),
+    Avn(AvnEncodeErrorKind),
 }
 macro_rules! impl_from {
     ($variant:ident, $error_kind:ty) => {
@@ -42,6 +43,7 @@ impl_from!(Jer, JerEncodeErrorKind);
 impl_from!(Coer, CoerEncodeErrorKind);
 impl_from!(Xer, XerEncodeErrorKind);
 impl_from!(Gser, GserEncodeErrorKind);
+impl_from!(Avn, AvnEncodeErrorKind);
 
 impl From<CodecEncodeError> for EncodeError {
     fn from(error: CodecEncodeError) -> Self {
@@ -249,6 +251,7 @@ impl EncodeError {
             CodecEncodeError::Coer(_) => crate::Codec::Coer,
             CodecEncodeError::Xer(_) => crate::Codec::Xer,
             CodecEncodeError::Gser(_) => crate::Codec::Gser,
+            CodecEncodeError::Avn(_) => crate::Codec::Avn,
         };
         Self {
             kind: Box::new(EncodeErrorKind::CodecSpecific { inner }),
@@ -482,6 +485,25 @@ pub enum GserEncodeErrorKind {
     /// Error when a character cannot be encoded
     #[snafu(display("Invalid character in GSER string"))]
     GserInvalidCharacter,
+}
+
+/// `EncodeError` kinds of `Kind::CodecSpecific` which are specific for AVN.
+#[derive(Snafu, Debug)]
+#[snafu(visibility(pub))]
+#[non_exhaustive]
+pub enum AvnEncodeErrorKind {
+    /// Internal encoder stack mismatch error
+    #[snafu(display("Internal encoder stack mismatch"))]
+    AvnInternalStackMismatch,
+    /// Error when encoding an integer fails
+    #[snafu(display("Failed to encode integer value"))]
+    AvnIntegerEncodingFailed,
+    /// Error when encoding a real number fails
+    #[snafu(display("Failed to encode real value"))]
+    AvnRealEncodingFailed,
+    /// Error when a character cannot be encoded
+    #[snafu(display("Invalid character in AVN string"))]
+    AvnInvalidCharacter,
 }
 
 impl crate::enc::Error for EncodeError {

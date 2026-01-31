@@ -25,6 +25,8 @@ pub enum Codec {
     Xer,
     /// [RFC 3641 — Generic String Encoding Rules](https://www.rfc-editor.org/rfc/rfc3641)
     Gser,
+    /// ITU-T X.680 — ASN.1 Value Notation
+    Avn,
 }
 
 impl core::fmt::Display for Codec {
@@ -40,6 +42,7 @@ impl core::fmt::Display for Codec {
             Self::Coer => write!(f, "COER"),
             Self::Xer => write!(f, "XER"),
             Self::Gser => write!(f, "GSER"),
+            Self::Avn => write!(f, "AVN"),
         }
     }
 }
@@ -65,6 +68,7 @@ impl Codec {
             Self::Coer => crate::coer::encode(value),
             Self::Xer => crate::xer::encode(value),
             Self::Gser => crate::gser::encode(value).map(alloc::string::String::into_bytes),
+            Self::Avn => crate::avn::encode(value).map(alloc::string::String::into_bytes),
         }
     }
 
@@ -108,6 +112,17 @@ impl Codec {
                 },
                 |s| crate::gser::decode(&s),
             ),
+            Self::Avn => alloc::string::String::from_utf8(input.to_vec()).map_or_else(
+                |e| {
+                    Err(crate::error::DecodeError::from_kind(
+                        crate::error::DecodeErrorKind::Custom {
+                            msg: alloc::format!("Failed to decode AVN from UTF8 bytes: {e:?}"),
+                        },
+                        *self,
+                    ))
+                },
+                |s| crate::avn::decode(&s),
+            ),
         }
     }
     /// Decodes `input` to `D` based on the encoded defined by `Codec`, returning the decoded value and the remaining input.
@@ -141,6 +156,12 @@ impl Codec {
                 },
                 *self,
             )),
+            Self::Avn => Err(crate::error::DecodeError::from_kind(
+                crate::error::DecodeErrorKind::Custom {
+                    msg: "AVN does not support decoding with remainder. ".into(),
+                },
+                *self,
+            )),
         }
     }
 
@@ -157,6 +178,7 @@ impl Codec {
         match self {
             Self::Jer => crate::jer::encode(value),
             Self::Gser => crate::gser::encode(value),
+            Self::Avn => crate::avn::encode(value),
             codec => Err(crate::error::EncodeError::from_kind(
                 crate::error::EncodeErrorKind::Custom {
                     msg: alloc::format!("{codec} is a binary-based encoding. Call `Codec::encode_to_binary` instead."),
@@ -176,6 +198,7 @@ impl Codec {
         match self {
             Self::Jer => crate::jer::decode(input),
             Self::Gser => crate::gser::decode(input),
+            Self::Avn => crate::avn::decode(input),
             codec => Err(crate::error::DecodeError::from_kind(
                 crate::error::DecodeErrorKind::Custom {
                     msg: alloc::format!("{codec} is a binary-based encoding. Call `Codec::decode_from_binary` instead."),
