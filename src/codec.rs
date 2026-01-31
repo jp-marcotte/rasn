@@ -23,6 +23,8 @@ pub enum Codec {
     Coer,
     /// X.693 — XML Encoding Rules
     Xer,
+    /// [RFC 3641 — Generic String Encoding Rules](https://www.rfc-editor.org/rfc/rfc3641)
+    Gser,
 }
 
 impl core::fmt::Display for Codec {
@@ -37,6 +39,7 @@ impl core::fmt::Display for Codec {
             Self::Oer => write!(f, "OER"),
             Self::Coer => write!(f, "COER"),
             Self::Xer => write!(f, "XER"),
+            Self::Gser => write!(f, "GSER"),
         }
     }
 }
@@ -61,6 +64,7 @@ impl Codec {
             Self::Oer => crate::oer::encode(value),
             Self::Coer => crate::coer::encode(value),
             Self::Xer => crate::xer::encode(value),
+            Self::Gser => crate::gser::encode(value).map(alloc::string::String::into_bytes),
         }
     }
 
@@ -93,6 +97,17 @@ impl Codec {
                 },
                 |s| crate::jer::decode(&s),
             ),
+            Self::Gser => alloc::string::String::from_utf8(input.to_vec()).map_or_else(
+                |e| {
+                    Err(crate::error::DecodeError::from_kind(
+                        crate::error::DecodeErrorKind::Custom {
+                            msg: alloc::format!("Failed to decode GSER from UTF8 bytes: {e:?}"),
+                        },
+                        *self,
+                    ))
+                },
+                |s| crate::gser::decode(&s),
+            ),
         }
     }
     /// Decodes `input` to `D` based on the encoded defined by `Codec`, returning the decoded value and the remaining input.
@@ -120,6 +135,12 @@ impl Codec {
                 },
                 *self,
             )),
+            Self::Gser => Err(crate::error::DecodeError::from_kind(
+                crate::error::DecodeErrorKind::Custom {
+                    msg: "GSER does not support decoding with remainder. ".into(),
+                },
+                *self,
+            )),
         }
     }
 
@@ -135,6 +156,7 @@ impl Codec {
     ) -> Result<alloc::string::String, crate::error::EncodeError> {
         match self {
             Self::Jer => crate::jer::encode(value),
+            Self::Gser => crate::gser::encode(value),
             codec => Err(crate::error::EncodeError::from_kind(
                 crate::error::EncodeErrorKind::Custom {
                     msg: alloc::format!("{codec} is a binary-based encoding. Call `Codec::encode_to_binary` instead."),
@@ -153,9 +175,10 @@ impl Codec {
     pub fn decode_from_str<D: Decode>(&self, input: &str) -> Result<D, crate::error::DecodeError> {
         match self {
             Self::Jer => crate::jer::decode(input),
+            Self::Gser => crate::gser::decode(input),
             codec => Err(crate::error::DecodeError::from_kind(
                 crate::error::DecodeErrorKind::Custom {
-                    msg: alloc::format!("{codec} is a text-based encoding. Call `Codec::decode_from_binary` instead."),
+                    msg: alloc::format!("{codec} is a binary-based encoding. Call `Codec::decode_from_binary` instead."),
                 },
                 *codec,
             )),

@@ -28,6 +28,7 @@ pub enum CodecDecodeError {
     Oer(OerDecodeErrorKind),
     Coer(CoerDecodeErrorKind),
     Xer(XerDecodeErrorKind),
+    Gser(GserDecodeErrorKind),
 }
 
 macro_rules! impl_from {
@@ -50,6 +51,7 @@ impl_from!(Jer, JerDecodeErrorKind);
 impl_from!(Oer, OerDecodeErrorKind);
 impl_from!(Coer, CoerDecodeErrorKind);
 impl_from!(Xer, XerDecodeErrorKind);
+impl_from!(Gser, GserDecodeErrorKind);
 
 impl From<CodecDecodeError> for DecodeError {
     fn from(error: CodecDecodeError) -> Self {
@@ -423,6 +425,7 @@ impl DecodeError {
             CodecDecodeError::Oer(_) => crate::Codec::Oer,
             CodecDecodeError::Coer(_) => crate::Codec::Coer,
             CodecDecodeError::Xer(_) => crate::Codec::Xer,
+            CodecDecodeError::Gser(_) => crate::Codec::Gser,
         };
         Self {
             kind: Box::new(DecodeErrorKind::CodecSpecific { inner }),
@@ -1020,6 +1023,54 @@ pub enum CoerDecodeErrorKind {
         /// Reason for the error.
         msg: alloc::string::String,
     },
+}
+
+/// `DecodeError` kinds of `Kind::CodecSpecific` which are specific for GSER.
+#[derive(Snafu, Debug)]
+#[snafu(visibility(pub))]
+#[non_exhaustive]
+pub enum GserDecodeErrorKind {
+    /// An error when the end of input is reached, but more data is needed.
+    #[snafu(display("Unexpected end of input while decoding GSER."))]
+    GserEndOfInput {},
+    /// An error when the GSER type is not the expected type.
+    #[snafu(display(
+        "Found mismatching GSER value. Expected type {}. Found value {}.",
+        needed,
+        found
+    ))]
+    GserTypeMismatch {
+        /// Expected GSER type.
+        needed: &'static str,
+        /// Found GSER value.
+        found: alloc::string::String,
+    },
+    /// An error when the GSER value is not a valid OID.
+    #[snafu(display("Failed to construct OID from value {value}"))]
+    InvalidOid {
+        /// The value that could not be converted to an OID.
+        value: alloc::string::String,
+    },
+    /// An error when the GSER value is not a valid enumerated discriminant.
+    #[snafu(display("Found invalid enumerated discriminant {discriminant}"))]
+    GserInvalidEnumDiscriminant {
+        /// The invalid enumerated discriminant.
+        discriminant: alloc::string::String,
+    },
+    /// An error when the GSER value is not a valid choice variant.
+    #[snafu(display("Found invalid choice variant {variant}"))]
+    InvalidChoiceVariant {
+        /// The invalid choice variant identifier.
+        variant: alloc::string::String,
+    },
+}
+
+impl GserDecodeErrorKind {
+    /// Helper function to create an error [`GserDecodeErrorKind::GserEndOfInput`].
+    #[must_use]
+    pub fn eoi() -> CodecDecodeError {
+        CodecDecodeError::Gser(GserDecodeErrorKind::GserEndOfInput {})
+    }
 }
 
 impl crate::de::Error for DecodeError {
