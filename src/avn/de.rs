@@ -9,10 +9,9 @@ use alloc::vec::Vec;
 use nom::{
     branch::alt,
     bytes::complete::{tag, take_while, take_while1},
-    character::complete::{char, multispace0, one_of},
-    combinator::{map, map_res, opt, recognize, value},
-    multi::many0,
-    sequence::{pair, preceded, tuple},
+    character::complete::{char, multispace0},
+    combinator::{map, opt, recognize, value},
+    sequence::pair,
     IResult,
 };
 // Required in no_std builds for f64::powi(); std provides it natively
@@ -30,15 +29,74 @@ use crate::{
     Decode,
 };
 
-/// Decodes AVN text format into Rust structures.
-pub struct Decoder<'input> {
-    input: &'input str,
+/// Intermediate owned representation of an AVN value.
+/// Used to avoid lifetime issues when decoding nested structures.
+#[derive(Debug, Clone)]
+pub enum AvnValue {
+    /// Boolean: TRUE or FALSE
+    Bool(bool),
+    /// Integer as string (preserves arbitrary precision)
+    Integer(String),
+    /// Real number as f64
+    Real(f64),
+    /// Null value
+    Null,
+    /// String value (UTF8, IA5, etc.)
+    String(String),
+    /// Hex-encoded bytes: '...'H
+    Bytes(Vec<u8>),
+    /// Bit string with exact bit count
+    BitString(crate::types::BitString),
+    /// OID as arc vector
+    Oid(Vec<u32>),
+    /// Enumerated identifier
+    Identifier(String),
+    /// Sequence/Set: ordered field name -> value pairs
+    Constructed(Vec<(String, AvnValue)>),
+    /// Sequence-of/Set-of: list of values
+    Array(Vec<AvnValue>),
+    /// Choice: (variant_name, inner_value)
+    Choice(String, Box<AvnValue>),
+    /// Absent optional field
+    Absent,
 }
 
-impl<'input> Decoder<'input> {
+/// Decodes AVN text format into Rust structures.
+///
+/// Uses an owned value stack approach (like JER) to avoid lifetime issues
+/// when decoding nested structures with field reordering.
+pub struct Decoder {
+    /// Stack of values to decode (like JER's approach)
+    stack: Vec<AvnValue>,
+}
+
+impl Decoder {
     /// Creates a new decoder from the given input string.
-    pub fn new(input: &'input str) -> Result<Self, DecodeError> {
-        Ok(Self { input })
+    pub fn new(input: &str) -> Result<Self, DecodeError> {
+        let (_, value) = Self::parse_to_value(input.trim()).map_err(|e| {
+            DecodeError::parser_fail(
+                alloc::format!("Failed to parse AVN: {e:?}"),
+                crate::Codec::Avn,
+            )
+        })?;
+        Ok(Self { stack: vec![value] })
+    }
+
+    /// Creates a decoder from an already-parsed value (for nested decoding)
+    fn from_value(value: AvnValue) -> Self {
+        Self { stack: vec![value] }
+    }
+
+    /// Pops the next value from the stack
+    fn pop(&mut self) -> Result<AvnValue, DecodeError> {
+        self.stack.pop().ok_or_else(|| {
+            DecodeError::from(AvnDecodeErrorKind::AvnEndOfInput {})
+        })
+    }
+
+    /// Peeks at the next value without removing it
+    fn peek(&self) -> Option<&AvnValue> {
+        self.stack.last()
     }
 
     /// Parses whitespace
@@ -65,8 +123,12 @@ impl<'input> Decoder<'input> {
     }
 
     /// Parses an identifier (used for enums, field names, choice variants)
+    /// ASN.1 identifiers must start with a letter, then can contain letters, digits, hyphens.
     fn parse_identifier(input: &str) -> IResult<&str, &str> {
-        take_while1(|c: char| c.is_alphanumeric() || c == '-' || c == '_')(input)
+        recognize(pair(
+            nom::character::complete::satisfy(|c| c.is_ascii_alphabetic() || c == '_'),
+            take_while(|c: char| c.is_alphanumeric() || c == '-' || c == '_'),
+        ))(input)
     }
 
     /// Parses an AVN string with doubled-quote escaping: "..." where "" means literal "
@@ -131,17 +193,6 @@ impl<'input> Decoder<'input> {
         Ok((input, bits))
     }
 
-    /// Parses hex '...'H as BitString (byte-aligned)
-    fn parse_hex_as_bitstring(input: &str) -> IResult<&str, BitString> {
-        let (input, bytes) = Self::parse_hex_string(input)?;
-        Ok((input, BitString::from_vec(bytes)))
-    }
-
-    /// Parses either hex '...'H or binary '...'B as BitString
-    fn parse_bit_string(input: &str) -> IResult<&str, BitString> {
-        alt((Self::parse_hex_as_bitstring, Self::parse_binary_string))(input)
-    }
-
     /// Converts a hex string to bytes
     fn bytes_from_hex(hex_string: &str) -> Option<Vec<u8>> {
         if hex_string.is_empty() {
@@ -161,48 +212,55 @@ impl<'input> Decoder<'input> {
     }
 
     /// Parses an OID in AVN format: { arc arc arc }
-    /// AVN uses space-separated arcs in braces
+    /// AVN uses space-separated arcs in braces (no commas)
+    /// Must have at least one arc to distinguish from empty sequence {}
     fn parse_oid(input: &str) -> IResult<&str, Vec<u32>> {
         let (input, _) = Self::ws(input)?;
         let (input, _) = char('{')(input)?;
         let (input, _) = Self::ws(input)?;
 
-        let (input, arcs) = many0(preceded(
-            Self::ws,
-            map_res(take_while1(|c: char| c.is_ascii_digit()), |s: &str| {
-                s.parse::<u32>()
-            }),
-        ))(input)?;
+        // Must have at least one arc (can't be empty)
+        let trimmed = input.trim_start();
+        if trimmed.starts_with('}') {
+            // Empty braces - not an OID
+            return Err(nom::Err::Error(nom::error::Error::new(
+                input,
+                nom::error::ErrorKind::Digit,
+            )));
+        }
 
-        let (input, _) = Self::ws(input)?;
-        let (input, _) = char('}')(input)?;
+        // Parse first arc (required)
+        let (remaining, first_arc_str) = take_while1(|c: char| c.is_ascii_digit())(trimmed)?;
+        let first_arc: u32 = first_arc_str.parse().map_err(|_| {
+            nom::Err::Error(nom::error::Error::new(trimmed, nom::error::ErrorKind::Digit))
+        })?;
 
-        Ok((input, arcs))
-    }
+        let mut arcs = vec![first_arc];
+        let mut remaining = remaining;
 
-    /// Parses an AVN REAL number
-    /// Supports: 0, PLUS-INFINITY, MINUS-INFINITY, { mantissa, base, exponent }
-    fn parse_real(input: &str) -> IResult<&str, f64> {
-        alt((
-            value(f64::INFINITY, tag("PLUS-INFINITY")),
-            value(f64::NEG_INFINITY, tag("MINUS-INFINITY")),
-            // AVN tuple format: { mantissa, base, exponent }
-            Self::parse_real_tuple,
-            // Also accept simple decimal for compatibility
-            map_res(
-                recognize(tuple((
-                    opt(char('-')),
-                    take_while1(|c: char| c.is_ascii_digit()),
-                    opt(pair(char('.'), take_while1(|c: char| c.is_ascii_digit()))),
-                    opt(tuple((
-                        one_of("Ee"),
-                        opt(one_of("+-")),
-                        take_while1(|c: char| c.is_ascii_digit()),
-                    ))),
-                ))),
-                |s: &str| s.parse::<f64>(),
-            ),
-        ))(input)
+        // Parse remaining space-separated arcs
+        loop {
+            let trimmed = remaining.trim_start();
+            if let Some(rest) = trimmed.strip_prefix('}') {
+                return Ok((rest, arcs));
+            }
+
+            // If we see a comma, this isn't an OID (might be REAL tuple)
+            if trimmed.starts_with(',') {
+                return Err(nom::Err::Error(nom::error::Error::new(
+                    trimmed,
+                    nom::error::ErrorKind::Char,
+                )));
+            }
+
+            // Parse next arc
+            let (rest, arc_str) = take_while1(|c: char| c.is_ascii_digit())(trimmed)?;
+            let arc: u32 = arc_str.parse().map_err(|_| {
+                nom::Err::Error(nom::error::Error::new(trimmed, nom::error::ErrorKind::Digit))
+            })?;
+            arcs.push(arc);
+            remaining = rest;
+        }
     }
 
     /// Parses AVN REAL tuple format: { mantissa, base, exponent }
@@ -286,168 +344,228 @@ impl<'input> Decoder<'input> {
         input.len()
     }
 
-    /// Parses a single field-value pair from a sequence
-    fn parse_field_value(input: &str) -> IResult<&str, (&str, &str)> {
-        let input = input.trim_start();
-        let (input, field_name) = Self::parse_identifier(input)?;
-        let input = input.trim_start();
+    // ============================================================================
+    // AvnValue parsing functions (owned intermediate representation)
+    // ============================================================================
 
-        let end_pos = Self::find_value_end(input);
-        let value_str = input[..end_pos].trim();
-        Ok((&input[end_pos..], (field_name, value_str)))
+    /// Parses any AVN value into an owned AvnValue.
+    fn parse_to_value(input: &str) -> IResult<&str, AvnValue> {
+        let input = input.trim();
+
+        // Try each value type in order - ORDER MATTERS!
+        alt((
+            // Boolean
+            map(Self::parse_boolean, AvnValue::Bool),
+            // Null
+            map(Self::parse_null, |_| AvnValue::Null),
+            // Hex string as Bytes (octet string) - BEFORE bit string!
+            map(Self::parse_hex_string, AvnValue::Bytes),
+            // Binary string as BitString ('...'B only)
+            map(Self::parse_binary_string, AvnValue::BitString),
+            // OID: { arc arc arc } (space-separated, no commas)
+            Self::parse_oid_value,
+            // REAL tuple: { mantissa, base, exponent } (comma-separated)
+            Self::parse_real_tuple_value,
+            // Constructed (sequence/set) or array
+            Self::parse_constructed_value,
+            // Choice (identifier: value)
+            Self::parse_choice_value,
+            // Special real values
+            Self::parse_special_real_value,
+            // Integer
+            map(Self::parse_integer, |s| AvnValue::Integer(s.into())),
+            // String
+            map(Self::parse_string, AvnValue::String),
+            // Bare identifier (enumerated)
+            map(Self::parse_identifier, |s| AvnValue::Identifier(s.into())),
+        ))(input)
     }
 
-    /// Parses a sequence/set: { field value, field value, ... }
-    /// Returns a list of (field_name, field_value_str) pairs
-    fn parse_sequence_content(input: &str) -> IResult<&str, Vec<(&str, &str)>> {
-        let input = input.trim_start();
+    /// Parses OID value: { arc arc arc } - space-separated integers, no commas
+    fn parse_oid_value(input: &str) -> IResult<&str, AvnValue> {
+        let (rest, arcs) = Self::parse_oid(input)?;
+        Ok((rest, AvnValue::Oid(arcs)))
+    }
+
+    /// Parses REAL tuple value: { mantissa, base, exponent }
+    fn parse_real_tuple_value(input: &str) -> IResult<&str, AvnValue> {
+        let (rest, value) = Self::parse_real_tuple(input)?;
+        Ok((rest, AvnValue::Real(value)))
+    }
+
+    /// Parses special real values: PLUS-INFINITY, MINUS-INFINITY
+    fn parse_special_real_value(input: &str) -> IResult<&str, AvnValue> {
+        alt((
+            map(tag("PLUS-INFINITY"), |_| AvnValue::Real(f64::INFINITY)),
+            map(tag("MINUS-INFINITY"), |_| AvnValue::Real(f64::NEG_INFINITY)),
+        ))(input)
+    }
+
+    /// Parses a constructed value: { field value, ... } or { value, ... }
+    /// Note: OID { 1 2 3 } and REAL { M, B, E } are handled separately before this
+    fn parse_constructed_value(input: &str) -> IResult<&str, AvnValue> {
+        let input = input.trim();
         let (input, _) = char('{')(input)?;
-        let input = input.trim_start();
+        let input = input.trim();
 
-        // Check for empty sequence
+        // Empty sequence
         if let Some(rest) = input.strip_prefix('}') {
-            return Ok((rest, Vec::new()));
+            return Ok((rest, AvnValue::Constructed(vec![])));
         }
 
-        let (input, first) = Self::parse_field_value(input)?;
-        let mut fields = vec![first];
+        // Peek to determine if this is named fields or array
+        // Named fields have: identifier value
+        // Arrays have: value, value (no field names)
+        let is_named = Self::peek_is_named_field(input);
 
+        if is_named {
+            Self::parse_named_fields(input)
+        } else {
+            Self::parse_array_values(input)
+        }
+    }
+
+    /// Peek ahead to determine if input starts with "identifier value" pattern
+    fn peek_is_named_field(input: &str) -> bool {
+        // Try parsing identifier followed by non-colon (choice has "id: value")
+        if let Ok((rest, _)) = Self::parse_identifier(input) {
+            let rest = rest.trim_start();
+            // If next char is ':', it's a choice, not a named field
+            // If next char is something else, it's a named field
+            !rest.starts_with(':') && !rest.is_empty()
+        } else {
+            false
+        }
+    }
+
+    /// Parse named fields: { field1 value1, field2 value2 }
+    fn parse_named_fields(input: &str) -> IResult<&str, AvnValue> {
+        let mut fields = Vec::new();
         let mut remaining = input;
+
         loop {
-            let trimmed = remaining.trim_start();
+            let trimmed = remaining.trim();
             if let Some(rest) = trimmed.strip_prefix('}') {
-                remaining = rest;
-                break;
+                return Ok((rest, AvnValue::Constructed(fields)));
             }
+
+            // Parse field name
+            let (rest, name) = Self::parse_identifier(trimmed)?;
+            let rest = rest.trim_start();
+
+            // Parse field value
+            let end_pos = Self::find_value_end(rest);
+            let value_str = &rest[..end_pos];
+            let (_, value) = Self::parse_to_value(value_str)?;
+
+            fields.push((name.into(), value));
+            remaining = &rest[end_pos..];
+
+            // Skip comma if present
+            let trimmed = remaining.trim_start();
             if let Some(after_comma) = trimmed.strip_prefix(',') {
-                let (rest, field) = Self::parse_field_value(after_comma)?;
-                fields.push(field);
-                remaining = rest;
+                remaining = after_comma;
             } else {
-                break;
+                remaining = trimmed;
             }
         }
-
-        Ok((remaining, fields))
     }
 
-    /// Parses a single value from a sequence-of
-    fn parse_single_value(input: &str) -> IResult<&str, &str> {
-        let input = input.trim_start();
-        let end_pos = Self::find_value_end(input);
-        let value_str = input[..end_pos].trim();
-        Ok((&input[end_pos..], value_str))
-    }
-
-    /// Parses a sequence of values: { value, value, ... }
-    fn parse_sequence_of_content(input: &str) -> IResult<&str, Vec<&str>> {
-        let input = input.trim_start();
-        let (input, _) = char('{')(input)?;
-        let input = input.trim_start();
-
-        // Check for empty sequence
-        if let Some(rest) = input.strip_prefix('}') {
-            return Ok((rest, Vec::new()));
-        }
-
-        let (input, first) = Self::parse_single_value(input)?;
-        let mut values = vec![first];
-
+    /// Parse array values: { value1, value2, ... }
+    fn parse_array_values(input: &str) -> IResult<&str, AvnValue> {
+        let mut values = Vec::new();
         let mut remaining = input;
+
         loop {
-            let trimmed = remaining.trim_start();
+            let trimmed = remaining.trim();
             if let Some(rest) = trimmed.strip_prefix('}') {
-                remaining = rest;
-                break;
+                return Ok((rest, AvnValue::Array(values)));
             }
+
+            // Parse value
+            let end_pos = Self::find_value_end(trimmed);
+            let value_str = &trimmed[..end_pos];
+            let (_, value) = Self::parse_to_value(value_str)?;
+
+            values.push(value);
+            remaining = &trimmed[end_pos..];
+
+            // Skip comma if present
+            let trimmed = remaining.trim_start();
             if let Some(after_comma) = trimmed.strip_prefix(',') {
-                let (rest, val) = Self::parse_single_value(after_comma)?;
-                values.push(val);
-                remaining = rest;
+                remaining = after_comma;
             } else {
-                break;
+                remaining = trimmed;
             }
         }
-
-        Ok((remaining, values))
     }
 
-    /// Parses a choice: identifier: value
-    fn parse_choice(input: &str) -> IResult<&str, (&str, &str)> {
+    /// Parse choice value: identifier: value
+    fn parse_choice_value(input: &str) -> IResult<&str, AvnValue> {
         let (input, _) = Self::ws(input)?;
         let (input, identifier) = Self::parse_identifier(input)?;
         let (input, _) = Self::ws(input)?;
         let (input, _) = char(':')(input)?;
         let (input, _) = Self::ws(input)?;
 
-        // The rest is the value
-        Ok(("", (identifier, input.trim())))
-    }
-
-    /// Consume and return the remaining input
-    fn take_input(&mut self) -> &'input str {
-        // If there's a null byte separator (from sequence field parsing),
-        // only take up to the null byte
-        if let Some(pos) = self.input.find('\0') {
-            let (current, rest) = self.input.split_at(pos);
-            self.input = &rest[1..]; // Skip the null byte
-            current
-        } else {
-            let input = self.input;
-            self.input = "";
-            input
-        }
+        let (rest, value) = Self::parse_to_value(input)?;
+        Ok((rest, AvnValue::Choice(identifier.into(), Box::new(value))))
     }
 }
 
-impl crate::Decoder for Decoder<'_> {
+impl crate::Decoder for Decoder {
     type Ok = ();
     type Error = DecodeError;
     type AnyDecoder<const R: usize, const E: usize> = Self;
 
     fn decode_any(&mut self, _: Tag) -> Result<Any, Self::Error> {
-        let input = self.take_input().trim();
-        // Try to parse as hex string for ANY type
-        match Self::parse_hex_string(input) {
-            Ok((_, bytes)) => Ok(Any::new(bytes)),
-            Err(_) => Ok(Any::new(input.as_bytes().to_vec())),
+        match self.pop()? {
+            AvnValue::Bytes(bytes) => Ok(Any::new(bytes)),
+            other => {
+                // For non-bytes, serialize back to string representation
+                Ok(Any::new(alloc::format!("{other:?}").into_bytes()))
+            }
         }
     }
 
     fn decode_bit_string(&mut self, _: Tag, _: Constraints) -> Result<BitString, Self::Error> {
-        let input = self.take_input().trim();
-        // X.680 §22.16-22.18: Accept both hstring and bstring formats
-        let (_, bits) = Self::parse_bit_string(input).map_err(|e| {
-            DecodeError::parser_fail(
-                alloc::format!("Failed to parse AVN bit string: {e:?}"),
-                self.codec(),
-            )
-        })?;
-        Ok(bits)
+        match self.pop()? {
+            AvnValue::BitString(bits) => Ok(bits),
+            AvnValue::Bytes(bytes) => Ok(BitString::from_vec(bytes)),
+            other => Err(AvnDecodeErrorKind::AvnTypeMismatch {
+                expected: "bit string",
+                found: alloc::format!("{other:?}"),
+            }
+            .into()),
+        }
     }
 
     fn decode_bool(&mut self, _: Tag) -> Result<bool, Self::Error> {
-        let input = self.take_input().trim();
-        let (_, value) = Self::parse_boolean(input).map_err(|e| {
-            DecodeError::parser_fail(
-                alloc::format!("Failed to parse AVN boolean: {e:?}"),
-                self.codec(),
-            )
-        })?;
-        Ok(value)
+        match self.pop()? {
+            AvnValue::Bool(b) => Ok(b),
+            other => Err(AvnDecodeErrorKind::AvnTypeMismatch {
+                expected: "boolean",
+                found: alloc::format!("{other:?}"),
+            }
+            .into()),
+        }
     }
 
     fn decode_enumerated<E: Enumerated>(&mut self, _: Tag) -> Result<E, Self::Error> {
-        let input = self.take_input().trim();
-        let (_, identifier) = Self::parse_identifier(input).map_err(|e| {
-            DecodeError::parser_fail(
-                alloc::format!("Failed to parse AVN enumerated: {e:?}"),
-                self.codec(),
-            )
-        })?;
-        E::from_identifier(identifier).ok_or_else(|| {
+        let identifier = match self.pop()? {
+            AvnValue::Identifier(s) => s,
+            other => {
+                return Err(AvnDecodeErrorKind::AvnTypeMismatch {
+                    expected: "enumerated",
+                    found: alloc::format!("{other:?}"),
+                }
+                .into())
+            }
+        };
+
+        E::from_identifier(&identifier).ok_or_else(|| {
             AvnDecodeErrorKind::AvnInvalidEnumDiscriminant {
-                discriminant: identifier.into(),
+                discriminant: identifier,
             }
             .into()
         })
@@ -458,13 +576,16 @@ impl crate::Decoder for Decoder<'_> {
         _: Tag,
         _: Constraints,
     ) -> Result<I, Self::Error> {
-        let input = self.take_input().trim();
-        let (_, int_str) = Self::parse_integer(input).map_err(|e| {
-            DecodeError::parser_fail(
-                alloc::format!("Failed to parse AVN integer: {e:?}"),
-                self.codec(),
-            )
-        })?;
+        let int_str = match self.pop()? {
+            AvnValue::Integer(s) => s,
+            other => {
+                return Err(AvnDecodeErrorKind::AvnTypeMismatch {
+                    expected: "integer",
+                    found: alloc::format!("{other:?}"),
+                }
+                .into())
+            }
+        };
 
         let value = int_str.parse::<i128>().map_err(|_| {
             DecodeError::parser_fail(
@@ -481,46 +602,61 @@ impl crate::Decoder for Decoder<'_> {
         _: Tag,
         _: Constraints,
     ) -> Result<R, Self::Error> {
-        let input = self.take_input().trim();
-        let (_, value) = Self::parse_real(input).map_err(|e| {
-            DecodeError::parser_fail(
-                alloc::format!("Failed to parse AVN real: {e:?}"),
-                self.codec(),
-            )
-        })?;
+        let value = match self.pop()? {
+            AvnValue::Real(f) => f,
+            AvnValue::Integer(s) => {
+                // Accept integer as real
+                s.parse::<f64>().map_err(|_| {
+                    DecodeError::parser_fail(
+                        alloc::format!("Failed to parse integer as real: {s}"),
+                        self.codec(),
+                    )
+                })?
+            }
+            other => {
+                return Err(AvnDecodeErrorKind::AvnTypeMismatch {
+                    expected: "real",
+                    found: alloc::format!("{other:?}"),
+                }
+                .into())
+            }
+        };
 
         R::try_from_float(value).ok_or_else(|| {
             AvnDecodeErrorKind::AvnTypeMismatch {
                 expected: "real number",
-                found: input.into(),
+                found: alloc::format!("{value}"),
             }
             .into()
         })
     }
 
     fn decode_null(&mut self, _: Tag) -> Result<(), Self::Error> {
-        let input = self.take_input().trim();
-        let (_, _) = Self::parse_null(input).map_err(|e| {
-            DecodeError::parser_fail(
-                alloc::format!("Failed to parse AVN null: {e:?}"),
-                self.codec(),
-            )
-        })?;
-        Ok(())
+        match self.pop()? {
+            AvnValue::Null => Ok(()),
+            other => Err(AvnDecodeErrorKind::AvnTypeMismatch {
+                expected: "null",
+                found: alloc::format!("{other:?}"),
+            }
+            .into()),
+        }
     }
 
     fn decode_object_identifier(&mut self, _: Tag) -> Result<ObjectIdentifier, Self::Error> {
-        let input = self.take_input().trim();
-        let (_, arcs) = Self::parse_oid(input).map_err(|e| {
-            DecodeError::parser_fail(
-                alloc::format!("Failed to parse AVN OID: {e:?}"),
-                self.codec(),
-            )
-        })?;
+        let arcs = match self.pop()? {
+            AvnValue::Oid(arcs) => arcs,
+            other => {
+                return Err(AvnDecodeErrorKind::AvnTypeMismatch {
+                    expected: "object identifier",
+                    found: alloc::format!("{other:?}"),
+                }
+                .into())
+            }
+        };
 
         Oid::new(&arcs).map(ObjectIdentifier::from).ok_or_else(|| {
             AvnDecodeErrorKind::AvnInvalidOid {
-                value: input.into(),
+                value: alloc::format!("{arcs:?}"),
             }
             .into()
         })
@@ -537,16 +673,26 @@ impl crate::Decoder for Decoder<'_> {
         DF: FnOnce() -> D,
         F: FnOnce(&mut Self::AnyDecoder<RC, EC>) -> Result<D, Self::Error>,
     {
-        let input = self.take_input().trim();
-        let (_, fields) = Self::parse_sequence_content(input).map_err(|e| {
-            DecodeError::parser_fail(
-                alloc::format!("Failed to parse AVN sequence: {e:?}"),
-                self.codec(),
-            )
-        })?;
+        let fields = match self.pop()? {
+            AvnValue::Constructed(fields) => fields,
+            AvnValue::Absent => {
+                return Err(AvnDecodeErrorKind::AvnTypeMismatch {
+                    expected: "sequence",
+                    found: "absent".into(),
+                }
+                .into())
+            }
+            other => {
+                return Err(AvnDecodeErrorKind::AvnTypeMismatch {
+                    expected: "sequence",
+                    found: alloc::format!("{other:?}"),
+                }
+                .into())
+            }
+        };
 
         // Build a map of field names to values
-        let field_map: alloc::collections::BTreeMap<&str, &str> = fields.into_iter().collect();
+        let field_map: alloc::collections::BTreeMap<_, _> = fields.into_iter().collect();
 
         // Get field names from the type
         let mut field_names = D::FIELDS.iter().map(|f| f.name).collect::<Vec<&str>>();
@@ -554,23 +700,11 @@ impl crate::Decoder for Decoder<'_> {
             field_names.extend(extended_fields.iter().map(|f| f.name));
         }
 
-        // Create a decoder that yields field values in order
-        let field_values: Vec<Option<&str>> = field_names
-            .iter()
-            .map(|name| field_map.get(name).copied())
-            .collect();
-
-        // Store values for decoding - use a null byte separator between field values
-        // Fields are in definition order, so decode_fn will decode them in that order
-        let values_str = field_values
-            .into_iter()
-            .map(|v| v.unwrap_or(""))
-            .collect::<Vec<_>>()
-            .join("\0");
-
-        // Leak the string so it has a static lifetime - this is a memory leak
-        // but for practical use cases it's negligible
-        self.input = Box::leak(values_str.into_boxed_str());
+        // Push field values onto stack in reverse order (so first field is on top)
+        for name in field_names.into_iter().rev() {
+            let value = field_map.get(name).cloned().unwrap_or(AvnValue::Absent);
+            self.stack.push(value);
+        }
 
         (decode_fn)(self)
     }
@@ -580,18 +714,25 @@ impl crate::Decoder for Decoder<'_> {
         _: Tag,
         _: Constraints,
     ) -> Result<SequenceOf<D>, Self::Error> {
-        let input = self.take_input().trim();
-        let (_, values) = Self::parse_sequence_of_content(input).map_err(|e| {
-            DecodeError::parser_fail(
-                alloc::format!("Failed to parse AVN sequence of: {e:?}"),
-                self.codec(),
-            )
-        })?;
+        let values = match self.pop()? {
+            AvnValue::Array(values) => values,
+            AvnValue::Constructed(fields) => {
+                // Accept constructed as array (for compatibility)
+                fields.into_iter().map(|(_, v)| v).collect()
+            }
+            other => {
+                return Err(AvnDecodeErrorKind::AvnTypeMismatch {
+                    expected: "sequence of",
+                    found: alloc::format!("{other:?}"),
+                }
+                .into())
+            }
+        };
 
         values
             .into_iter()
-            .map(|value_str| {
-                let mut decoder = Decoder::new(value_str)?;
+            .map(|value| {
+                let mut decoder = Decoder::from_value(value);
                 D::decode(&mut decoder)
             })
             .collect()
@@ -602,18 +743,22 @@ impl crate::Decoder for Decoder<'_> {
         _: Tag,
         _: Constraints,
     ) -> Result<SetOf<D>, Self::Error> {
-        let input = self.take_input().trim();
-        let (_, values) = Self::parse_sequence_of_content(input).map_err(|e| {
-            DecodeError::parser_fail(
-                alloc::format!("Failed to parse AVN set of: {e:?}"),
-                self.codec(),
-            )
-        })?;
+        let values = match self.pop()? {
+            AvnValue::Array(values) => values,
+            AvnValue::Constructed(fields) => fields.into_iter().map(|(_, v)| v).collect(),
+            other => {
+                return Err(AvnDecodeErrorKind::AvnTypeMismatch {
+                    expected: "set of",
+                    found: alloc::format!("{other:?}"),
+                }
+                .into())
+            }
+        };
 
         values
             .into_iter()
-            .try_fold(SetOf::new(), |mut acc, value_str| {
-                let mut decoder = Decoder::new(value_str)?;
+            .try_fold(SetOf::new(), |mut acc, value| {
+                let mut decoder = Decoder::from_value(value);
                 acc.insert(D::decode(&mut decoder)?);
                 Ok(acc)
             })
@@ -627,25 +772,25 @@ impl crate::Decoder for Decoder<'_> {
     where
         T: From<&'buf [u8]> + From<Vec<u8>>,
     {
-        let input = self.take_input().trim();
-        let (_, bytes) = Self::parse_hex_string(input).map_err(|e| {
-            DecodeError::parser_fail(
-                alloc::format!("Failed to parse AVN octet string: {e:?}"),
-                self.codec(),
-            )
-        })?;
-        Ok(T::from(bytes))
+        match self.pop()? {
+            AvnValue::Bytes(bytes) => Ok(T::from(bytes)),
+            other => Err(AvnDecodeErrorKind::AvnTypeMismatch {
+                expected: "octet string",
+                found: alloc::format!("{other:?}"),
+            }
+            .into()),
+        }
     }
 
     fn decode_utf8_string(&mut self, _: Tag, _: Constraints) -> Result<Utf8String, Self::Error> {
-        let input = self.take_input().trim();
-        let (_, s) = Self::parse_string(input).map_err(|e| {
-            DecodeError::parser_fail(
-                alloc::format!("Failed to parse AVN string: {e:?}"),
-                self.codec(),
-            )
-        })?;
-        Ok(s)
+        match self.pop()? {
+            AvnValue::String(s) => Ok(s),
+            other => Err(AvnDecodeErrorKind::AvnTypeMismatch {
+                expected: "string",
+                found: alloc::format!("{other:?}"),
+            }
+            .into()),
+        }
     }
 
     fn decode_visible_string(
@@ -653,13 +798,16 @@ impl crate::Decoder for Decoder<'_> {
         _: Tag,
         _: Constraints,
     ) -> Result<VisibleString, Self::Error> {
-        let input = self.take_input().trim();
-        let (_, s) = Self::parse_string(input).map_err(|e| {
-            DecodeError::parser_fail(
-                alloc::format!("Failed to parse AVN string: {e:?}"),
-                self.codec(),
-            )
-        })?;
+        let s = match self.pop()? {
+            AvnValue::String(s) => s,
+            other => {
+                return Err(AvnDecodeErrorKind::AvnTypeMismatch {
+                    expected: "string",
+                    found: alloc::format!("{other:?}"),
+                }
+                .into())
+            }
+        };
         s.try_into().map_err(|e| {
             DecodeError::string_conversion_failed(
                 Tag::VISIBLE_STRING,
@@ -674,13 +822,16 @@ impl crate::Decoder for Decoder<'_> {
         _: Tag,
         _: Constraints,
     ) -> Result<GeneralString, Self::Error> {
-        let input = self.take_input().trim();
-        let (_, s) = Self::parse_string(input).map_err(|e| {
-            DecodeError::parser_fail(
-                alloc::format!("Failed to parse AVN string: {e:?}"),
-                self.codec(),
-            )
-        })?;
+        let s = match self.pop()? {
+            AvnValue::String(s) => s,
+            other => {
+                return Err(AvnDecodeErrorKind::AvnTypeMismatch {
+                    expected: "string",
+                    found: alloc::format!("{other:?}"),
+                }
+                .into())
+            }
+        };
         s.try_into().map_err(|e| {
             DecodeError::string_conversion_failed(
                 Tag::GENERAL_STRING,
@@ -695,13 +846,16 @@ impl crate::Decoder for Decoder<'_> {
         _: Tag,
         _: Constraints,
     ) -> Result<GraphicString, Self::Error> {
-        let input = self.take_input().trim();
-        let (_, s) = Self::parse_string(input).map_err(|e| {
-            DecodeError::parser_fail(
-                alloc::format!("Failed to parse AVN string: {e:?}"),
-                self.codec(),
-            )
-        })?;
+        let s = match self.pop()? {
+            AvnValue::String(s) => s,
+            other => {
+                return Err(AvnDecodeErrorKind::AvnTypeMismatch {
+                    expected: "string",
+                    found: alloc::format!("{other:?}"),
+                }
+                .into())
+            }
+        };
         s.try_into().map_err(|e| {
             DecodeError::string_conversion_failed(
                 Tag::GRAPHIC_STRING,
@@ -712,13 +866,16 @@ impl crate::Decoder for Decoder<'_> {
     }
 
     fn decode_ia5_string(&mut self, _: Tag, _: Constraints) -> Result<Ia5String, Self::Error> {
-        let input = self.take_input().trim();
-        let (_, s) = Self::parse_string(input).map_err(|e| {
-            DecodeError::parser_fail(
-                alloc::format!("Failed to parse AVN string: {e:?}"),
-                self.codec(),
-            )
-        })?;
+        let s = match self.pop()? {
+            AvnValue::String(s) => s,
+            other => {
+                return Err(AvnDecodeErrorKind::AvnTypeMismatch {
+                    expected: "string",
+                    found: alloc::format!("{other:?}"),
+                }
+                .into())
+            }
+        };
         s.try_into().map_err(|e| {
             DecodeError::string_conversion_failed(
                 Tag::IA5_STRING,
@@ -733,13 +890,16 @@ impl crate::Decoder for Decoder<'_> {
         _: Tag,
         _: Constraints,
     ) -> Result<PrintableString, Self::Error> {
-        let input = self.take_input().trim();
-        let (_, s) = Self::parse_string(input).map_err(|e| {
-            DecodeError::parser_fail(
-                alloc::format!("Failed to parse AVN string: {e:?}"),
-                self.codec(),
-            )
-        })?;
+        let s = match self.pop()? {
+            AvnValue::String(s) => s,
+            other => {
+                return Err(AvnDecodeErrorKind::AvnTypeMismatch {
+                    expected: "string",
+                    found: alloc::format!("{other:?}"),
+                }
+                .into())
+            }
+        };
         s.try_into().map_err(|e| {
             DecodeError::string_conversion_failed(
                 Tag::PRINTABLE_STRING,
@@ -754,13 +914,16 @@ impl crate::Decoder for Decoder<'_> {
         _: Tag,
         _: Constraints,
     ) -> Result<NumericString, Self::Error> {
-        let input = self.take_input().trim();
-        let (_, s) = Self::parse_string(input).map_err(|e| {
-            DecodeError::parser_fail(
-                alloc::format!("Failed to parse AVN string: {e:?}"),
-                self.codec(),
-            )
-        })?;
+        let s = match self.pop()? {
+            AvnValue::String(s) => s,
+            other => {
+                return Err(AvnDecodeErrorKind::AvnTypeMismatch {
+                    expected: "string",
+                    found: alloc::format!("{other:?}"),
+                }
+                .into())
+            }
+        };
         s.try_into().map_err(|e| {
             DecodeError::string_conversion_failed(
                 Tag::NUMERIC_STRING,
@@ -775,13 +938,16 @@ impl crate::Decoder for Decoder<'_> {
         _: Tag,
         _: Constraints,
     ) -> Result<TeletexString, Self::Error> {
-        let input = self.take_input().trim();
-        let (_, s) = Self::parse_string(input).map_err(|e| {
-            DecodeError::parser_fail(
-                alloc::format!("Failed to parse AVN string: {e:?}"),
-                self.codec(),
-            )
-        })?;
+        let s = match self.pop()? {
+            AvnValue::String(s) => s,
+            other => {
+                return Err(AvnDecodeErrorKind::AvnTypeMismatch {
+                    expected: "string",
+                    found: alloc::format!("{other:?}"),
+                }
+                .into())
+            }
+        };
         s.try_into().map_err(|e| {
             DecodeError::string_conversion_failed(
                 Tag::TELETEX_STRING,
@@ -792,13 +958,16 @@ impl crate::Decoder for Decoder<'_> {
     }
 
     fn decode_bmp_string(&mut self, _: Tag, _: Constraints) -> Result<BmpString, Self::Error> {
-        let input = self.take_input().trim();
-        let (_, s) = Self::parse_string(input).map_err(|e| {
-            DecodeError::parser_fail(
-                alloc::format!("Failed to parse AVN string: {e:?}"),
-                self.codec(),
-            )
-        })?;
+        let s = match self.pop()? {
+            AvnValue::String(s) => s,
+            other => {
+                return Err(AvnDecodeErrorKind::AvnTypeMismatch {
+                    expected: "string",
+                    found: alloc::format!("{other:?}"),
+                }
+                .into())
+            }
+        };
         s.try_into().map_err(|e| {
             DecodeError::string_conversion_failed(
                 Tag::BMP_STRING,
@@ -820,35 +989,44 @@ impl crate::Decoder for Decoder<'_> {
     }
 
     fn decode_utc_time(&mut self, _: Tag) -> Result<UtcTime, Self::Error> {
-        let input = self.take_input().trim();
-        let (_, s) = Self::parse_string(input).map_err(|e| {
-            DecodeError::parser_fail(
-                alloc::format!("Failed to parse AVN time string: {e:?}"),
-                self.codec(),
-            )
-        })?;
+        let s = match self.pop()? {
+            AvnValue::String(s) => s,
+            other => {
+                return Err(AvnDecodeErrorKind::AvnTypeMismatch {
+                    expected: "utc time string",
+                    found: alloc::format!("{other:?}"),
+                }
+                .into())
+            }
+        };
         crate::ber::de::Decoder::parse_any_utc_time_string(s)
     }
 
     fn decode_generalized_time(&mut self, _: Tag) -> Result<GeneralizedTime, Self::Error> {
-        let input = self.take_input().trim();
-        let (_, s) = Self::parse_string(input).map_err(|e| {
-            DecodeError::parser_fail(
-                alloc::format!("Failed to parse AVN time string: {e:?}"),
-                self.codec(),
-            )
-        })?;
+        let s = match self.pop()? {
+            AvnValue::String(s) => s,
+            other => {
+                return Err(AvnDecodeErrorKind::AvnTypeMismatch {
+                    expected: "generalized time string",
+                    found: alloc::format!("{other:?}"),
+                }
+                .into())
+            }
+        };
         crate::ber::de::Decoder::parse_any_generalized_time_string(s)
     }
 
     fn decode_date(&mut self, _: Tag) -> Result<Date, Self::Error> {
-        let input = self.take_input().trim();
-        let (_, s) = Self::parse_string(input).map_err(|e| {
-            DecodeError::parser_fail(
-                alloc::format!("Failed to parse AVN date string: {e:?}"),
-                self.codec(),
-            )
-        })?;
+        let s = match self.pop()? {
+            AvnValue::String(s) => s,
+            other => {
+                return Err(AvnDecodeErrorKind::AvnTypeMismatch {
+                    expected: "date string",
+                    found: alloc::format!("{other:?}"),
+                }
+                .into())
+            }
+        };
         crate::ber::de::Decoder::parse_date_string(&s)
     }
 
@@ -864,16 +1042,18 @@ impl crate::Decoder for Decoder<'_> {
         D: Fn(&mut Self::AnyDecoder<RC, EC>, usize, Tag) -> Result<FIELDS, Self::Error>,
         F: FnOnce(Vec<FIELDS>) -> Result<SET, Self::Error>,
     {
-        let input = self.take_input().trim();
-        let (_, fields) = Self::parse_sequence_content(input).map_err(|e| {
-            DecodeError::parser_fail(
-                alloc::format!("Failed to parse AVN set: {e:?}"),
-                self.codec(),
-            )
-        })?;
+        let fields = match self.pop()? {
+            AvnValue::Constructed(fields) => fields,
+            other => {
+                return Err(AvnDecodeErrorKind::AvnTypeMismatch {
+                    expected: "set",
+                    found: alloc::format!("{other:?}"),
+                }
+                .into())
+            }
+        };
 
-        // Build a map of field names to values
-        let field_map: alloc::collections::BTreeMap<&str, &str> = fields.into_iter().collect();
+        let field_map: alloc::collections::BTreeMap<_, _> = fields.into_iter().collect();
 
         // Get field info from the type and decode in tag order
         let mut field_indices: Vec<_> = SET::FIELDS.iter().enumerate().collect();
@@ -882,8 +1062,8 @@ impl crate::Decoder for Decoder<'_> {
 
         let mut decoded_fields = Vec::new();
         for (index, field) in field_indices.into_iter() {
-            let value_str = field_map.get(field.name).copied().unwrap_or("");
-            self.input = value_str;
+            let value = field_map.get(field.name).cloned().unwrap_or(AvnValue::Absent);
+            self.stack.push(value);
             decoded_fields.push((decode_fn)(self, index, field.tag)?);
         }
 
@@ -893,8 +1073,8 @@ impl crate::Decoder for Decoder<'_> {
             .flat_map(|fields| fields.iter())
             .enumerate()
         {
-            let value_str = field_map.get(field.name).copied().unwrap_or("");
-            self.input = value_str;
+            let value = field_map.get(field.name).cloned().unwrap_or(AvnValue::Absent);
+            self.stack.push(value);
             decoded_fields.push((decode_fn)(self, index + SET::FIELDS.len(), field.tag)?);
         }
 
@@ -905,28 +1085,22 @@ impl crate::Decoder for Decoder<'_> {
     where
         D: DecodeChoice,
     {
-        // Save the rest of the input (after null separator) before processing
-        let rest = if let Some(pos) = self.input.find('\0') {
-            let (current, rest) = self.input.split_at(pos);
-            self.input = current;
-            Some(&rest[1..]) // Skip the null byte
-        } else {
-            None
+        let (identifier, inner_value) = match self.pop()? {
+            AvnValue::Choice(id, value) => (id, *value),
+            other => {
+                return Err(AvnDecodeErrorKind::AvnTypeMismatch {
+                    expected: "choice",
+                    found: alloc::format!("{other:?}"),
+                }
+                .into())
+            }
         };
-
-        let input = self.take_input().trim();
-        let (_, (identifier, value_str)) = Self::parse_choice(input).map_err(|e| {
-            DecodeError::parser_fail(
-                alloc::format!("Failed to parse AVN choice: {e:?}"),
-                self.codec(),
-            )
-        })?;
 
         // Find the tag for this identifier
         let tag = D::IDENTIFIERS
             .iter()
             .enumerate()
-            .find(|(_, id)| id.eq_ignore_ascii_case(identifier))
+            .find(|(_, id)| id.eq_ignore_ascii_case(&identifier))
             .and_then(|(i, _)| {
                 variants::Variants::from_slice(
                     &[D::VARIANTS, D::EXTENDED_VARIANTS.unwrap_or(&[])].concat(),
@@ -935,45 +1109,24 @@ impl crate::Decoder for Decoder<'_> {
                 .copied()
             })
             .ok_or_else(|| AvnDecodeErrorKind::AvnInvalidChoiceVariant {
-                variant: identifier.into(),
+                variant: identifier,
             })?;
 
-        self.input = value_str;
-        let result = D::from_tag(self, tag)?;
-
-        // Restore the rest of the input
-        if let Some(rest) = rest {
-            self.input = rest;
-        }
-
-        Ok(result)
+        // Push the inner value and decode
+        self.stack.push(inner_value);
+        D::from_tag(self, tag)
     }
 
     fn decode_optional<D: Decode>(&mut self) -> Result<Option<D>, Self::Error> {
-        // In AVN sequences, look for the next field value separated by null byte
-        if self.input.is_empty() {
-            return Ok(None);
-        }
-
-        // Check if there's a separator
-        if let Some(pos) = self.input.find('\0') {
-            let (current, rest) = self.input.split_at(pos);
-            if current.is_empty() {
-                self.input = &rest[1..]; // Skip the null separator
-                return Ok(None);
+        match self.peek() {
+            Some(AvnValue::Absent) | None => {
+                self.stack.pop(); // Remove the Absent marker
+                Ok(None)
             }
-            self.input = current;
-            let result = D::decode(self)?;
-            self.input = &rest[1..]; // Skip the null separator
-            Ok(Some(result))
-        } else {
-            let current = self.input;
-            if current.is_empty() {
-                return Ok(None);
+            Some(_) => {
+                // Value present, decode it
+                Ok(Some(D::decode(self)?))
             }
-            self.input = "";
-            let mut decoder = Decoder::new(current)?;
-            Ok(Some(D::decode(&mut decoder)?))
         }
     }
 
@@ -998,13 +1151,13 @@ impl crate::Decoder for Decoder<'_> {
 
     fn decode_extension_addition_with_explicit_tag_and_constraints<D>(
         &mut self,
-        tag: Tag,
-        constraints: Constraints,
+        _: Tag,
+        _: Constraints,
     ) -> Result<Option<D>, Self::Error>
     where
         D: Decode,
     {
-        self.decode_extension_addition_with_tag_and_constraints::<D>(tag, constraints)
+        self.decode_optional()
     }
 
     fn decode_extension_addition_with_tag_and_constraints<D>(
