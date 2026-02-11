@@ -25,10 +25,12 @@ pub mod types;
 // Data Formats
 
 pub mod aper;
+pub mod avn;
 pub mod ber;
 pub mod cer;
 pub mod coer;
 pub mod der;
+pub mod gser;
 pub mod jer;
 pub mod oer;
 pub mod uper;

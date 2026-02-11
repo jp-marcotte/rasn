@@ -28,6 +28,8 @@ pub enum CodecDecodeError {
     Oer(OerDecodeErrorKind),
     Coer(CoerDecodeErrorKind),
     Xer(XerDecodeErrorKind),
+    Gser(GserDecodeErrorKind),
+    Avn(AvnDecodeErrorKind),
 }
 
 macro_rules! impl_from {
@@ -50,6 +52,8 @@ impl_from!(Jer, JerDecodeErrorKind);
 impl_from!(Oer, OerDecodeErrorKind);
 impl_from!(Coer, CoerDecodeErrorKind);
 impl_from!(Xer, XerDecodeErrorKind);
+impl_from!(Gser, GserDecodeErrorKind);
+impl_from!(Avn, AvnDecodeErrorKind);
 
 impl From<CodecDecodeError> for DecodeError {
     fn from(error: CodecDecodeError) -> Self {
@@ -423,6 +427,8 @@ impl DecodeError {
             CodecDecodeError::Oer(_) => crate::Codec::Oer,
             CodecDecodeError::Coer(_) => crate::Codec::Coer,
             CodecDecodeError::Xer(_) => crate::Codec::Xer,
+            CodecDecodeError::Gser(_) => crate::Codec::Gser,
+            CodecDecodeError::Avn(_) => crate::Codec::Avn,
         };
         Self {
             kind: Box::new(DecodeErrorKind::CodecSpecific { inner }),
@@ -1020,6 +1026,120 @@ pub enum CoerDecodeErrorKind {
         /// Reason for the error.
         msg: alloc::string::String,
     },
+}
+
+/// `DecodeError` kinds of `Kind::CodecSpecific` which are specific for GSER.
+#[derive(Snafu, Debug)]
+#[snafu(visibility(pub))]
+#[non_exhaustive]
+pub enum GserDecodeErrorKind {
+    /// An error when the end of input is reached, but more data is needed.
+    #[snafu(display("Unexpected end of input while decoding GSER."))]
+    GserEndOfInput {},
+    /// An error when the GSER type is not the expected type.
+    #[snafu(display(
+        "Found mismatching GSER value. Expected type {}. Found value {}.",
+        needed,
+        found
+    ))]
+    GserTypeMismatch {
+        /// Expected GSER type.
+        needed: &'static str,
+        /// Found GSER value.
+        found: alloc::string::String,
+    },
+    /// An error when the GSER value is not a valid OID.
+    #[snafu(display("Failed to construct OID from value {value}"))]
+    InvalidOid {
+        /// The value that could not be converted to an OID.
+        value: alloc::string::String,
+    },
+    /// An error when the GSER value is not a valid enumerated discriminant.
+    #[snafu(display("Found invalid enumerated discriminant {discriminant}"))]
+    GserInvalidEnumDiscriminant {
+        /// The invalid enumerated discriminant.
+        discriminant: alloc::string::String,
+    },
+    /// An error when the GSER value is not a valid choice variant.
+    #[snafu(display("Found invalid choice variant {variant}"))]
+    InvalidChoiceVariant {
+        /// The invalid choice variant identifier.
+        variant: alloc::string::String,
+    },
+}
+
+impl GserDecodeErrorKind {
+    /// Helper function to create an error [`GserDecodeErrorKind::GserEndOfInput`].
+    #[must_use]
+    pub fn eoi() -> CodecDecodeError {
+        CodecDecodeError::Gser(GserDecodeErrorKind::GserEndOfInput {})
+    }
+}
+
+/// `DecodeError` kinds of `Kind::CodecSpecific` which are specific for AVN.
+#[derive(Snafu, Debug)]
+#[snafu(visibility(pub))]
+#[non_exhaustive]
+pub enum AvnDecodeErrorKind {
+    /// An error when the end of input is reached, but more data is needed.
+    #[snafu(display("Unexpected end of input while decoding AVN."))]
+    AvnEndOfInput {},
+    /// An error when the AVN type is not the expected type.
+    #[snafu(display(
+        "Found mismatching AVN value. Expected type {}. Found value {}.",
+        expected,
+        found
+    ))]
+    AvnTypeMismatch {
+        /// Expected AVN type.
+        expected: &'static str,
+        /// Found AVN value.
+        found: alloc::string::String,
+    },
+    /// An error when the AVN value is not a valid OID.
+    #[snafu(display("Failed to construct OID from value {value}"))]
+    AvnInvalidOid {
+        /// The value that could not be converted to an OID.
+        value: alloc::string::String,
+    },
+    /// An error when the AVN value is not a valid enumerated discriminant.
+    #[snafu(display("Found invalid enumerated discriminant {discriminant}"))]
+    AvnInvalidEnumDiscriminant {
+        /// The invalid enumerated discriminant.
+        discriminant: alloc::string::String,
+    },
+    /// An error when the AVN value is not a valid choice variant.
+    #[snafu(display("Found invalid choice variant {variant}"))]
+    AvnInvalidChoiceVariant {
+        /// The invalid choice variant identifier.
+        variant: alloc::string::String,
+    },
+    /// An error when the AVN BIT STRING value is invalid.
+    #[snafu(display("Invalid BIT STRING notation: {value}"))]
+    AvnInvalidBitString {
+        /// The invalid bit string value.
+        value: alloc::string::String,
+    },
+    /// An error when the AVN REAL notation is invalid.
+    #[snafu(display("Invalid REAL notation: {value}"))]
+    AvnInvalidRealNotation {
+        /// The invalid real value.
+        value: alloc::string::String,
+    },
+    /// A general parse error.
+    #[snafu(display("Parse error: {msg}"))]
+    AvnParseError {
+        /// The parse error message.
+        msg: alloc::string::String,
+    },
+}
+
+impl AvnDecodeErrorKind {
+    /// Helper function to create an error [`AvnDecodeErrorKind::AvnEndOfInput`].
+    #[must_use]
+    pub fn eoi() -> CodecDecodeError {
+        CodecDecodeError::Avn(AvnDecodeErrorKind::AvnEndOfInput {})
+    }
 }
 
 impl crate::de::Error for DecodeError {
