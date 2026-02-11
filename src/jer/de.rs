@@ -18,6 +18,7 @@ macro_rules! decode_jer_value {
     ($decoder_fn:expr, $input:expr) => {
         $input
             .pop()
+            .flatten()
             .ok_or_else(|| DecodeError::from(JerDecodeErrorKind::eoi()))
             .and_then($decoder_fn)
     };
@@ -25,7 +26,7 @@ macro_rules! decode_jer_value {
 
 /// Decodes JSON Encoding Rules data into Rust structures.
 pub struct Decoder {
-    stack: alloc::vec::Vec<Value>,
+    stack: alloc::vec::Vec<Option<Value>>,
 }
 
 impl Decoder {
@@ -38,7 +39,7 @@ impl Decoder {
             )
         })?;
         Ok(Self {
-            stack: alloc::vec![root],
+            stack: alloc::vec![Some(root)],
         })
     }
 }
@@ -46,7 +47,7 @@ impl Decoder {
 impl From<Value> for Decoder {
     fn from(value: Value) -> Self {
         Self {
-            stack: alloc::vec![value],
+            stack: alloc::vec![Some(value)],
         }
     }
 }
@@ -82,7 +83,7 @@ impl crate::Decoder for Decoder {
             })?;
             (value, *size)
         } else {
-            let last = self.stack.pop().ok_or_else(JerDecodeErrorKind::eoi)?;
+            let last = self.stack.pop().flatten().ok_or_else(JerDecodeErrorKind::eoi)?;
             let value_map = last
                 .as_object()
                 .ok_or_else(|| JerDecodeErrorKind::TypeMismatch {
@@ -178,7 +179,7 @@ impl crate::Decoder for Decoder {
         D: Constructed<RC, EC>,
         F: FnOnce(&mut Self) -> Result<D, Self::Error>,
     {
-        let mut last = self.stack.pop().ok_or_else(JerDecodeErrorKind::eoi)?;
+        let mut last = self.stack.pop().flatten().ok_or_else(JerDecodeErrorKind::eoi)?;
         let value_map = last
             .as_object_mut()
             .ok_or_else(|| JerDecodeErrorKind::TypeMismatch {
@@ -194,8 +195,7 @@ impl crate::Decoder for Decoder {
         }
         field_names.reverse();
         for name in field_names {
-            self.stack
-                .push(value_map.remove(name).unwrap_or(Value::Null));
+            self.stack.push(value_map.remove(name));
         }
 
         (decode_fn)(self)
@@ -375,7 +375,7 @@ impl crate::Decoder for Decoder {
         D: Fn(&mut Self::AnyDecoder<RC, EC>, usize, Tag) -> Result<FIELDS, Self::Error>,
         F: FnOnce(alloc::vec::Vec<FIELDS>) -> Result<SET, Self::Error>,
     {
-        let mut last = self.stack.pop().ok_or_else(JerDecodeErrorKind::eoi)?;
+        let mut last = self.stack.pop().flatten().ok_or_else(JerDecodeErrorKind::eoi)?;
         let value_map = last
             .as_object_mut()
             .ok_or_else(|| JerDecodeErrorKind::TypeMismatch {
@@ -390,8 +390,7 @@ impl crate::Decoder for Decoder {
         field_indices
             .sort_by(|(_, a), (_, b)| a.tag_tree.smallest_tag().cmp(&b.tag_tree.smallest_tag()));
         for (index, field) in field_indices.into_iter() {
-            self.stack
-                .push(value_map.remove(field.name).unwrap_or(Value::Null));
+            self.stack.push(value_map.remove(field.name));
             fields.push((decode_fn)(self, index, field.tag)?);
         }
 
@@ -400,8 +399,7 @@ impl crate::Decoder for Decoder {
             .flat_map(|fields| fields.iter())
             .enumerate()
         {
-            self.stack
-                .push(value_map.remove(field.name).unwrap_or(Value::Null));
+            self.stack.push(value_map.remove(field.name));
             fields.push((decode_fn)(self, index + SET::FIELDS.len(), field.tag)?);
         }
 
@@ -418,9 +416,9 @@ impl crate::Decoder for Decoder {
     fn decode_optional<D: crate::Decode>(&mut self) -> Result<Option<D>, Self::Error> {
         let last = self.stack.pop().ok_or_else(JerDecodeErrorKind::eoi)?;
         match last {
-            Value::Null => Ok(None),
-            v => {
-                self.stack.push(v);
+            None => Ok(None),
+            Some(v) => {
+                self.stack.push(Some(v));
                 Some(D::decode(self)).transpose()
             }
         }
@@ -605,7 +603,7 @@ impl Decoder {
             .clone()
             .into_iter()
             .map(|v| {
-                self.stack.push(v);
+                self.stack.push(Some(v));
                 D::decode(self)
             })
             .collect()
@@ -624,7 +622,7 @@ impl Decoder {
             .clone()
             .into_iter()
             .try_fold(SetOf::new(), |mut acc, v| {
-                self.stack.push(v);
+                self.stack.push(Some(v));
                 acc.insert(D::decode(self)?);
                 Ok(acc)
             })
@@ -666,7 +664,7 @@ impl Decoder {
                 .get(i)
                 {
                     Some(t) => {
-                        self.stack.push(v.clone());
+                        self.stack.push(Some(v.clone()));
                         *t
                     }
                     None => Tag::EOC,
